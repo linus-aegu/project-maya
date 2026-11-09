@@ -25,8 +25,10 @@ crash_at = int(os.environ.get("FAKE_CRASH_AT", "0"))  # the request that ends th
 hang_at = int(os.environ.get("FAKE_HANG_AT", "0"))    # the request that never answers
 print("READY 131072 stop" + (" multi=3" if multi else ""), flush=True)
 shared, n = None, 0
+log = open("gen.log", "a")                            # (each request line, for the tests to read)
 for line in sys.stdin:
     line = line.strip()
+    log.write(line[:200] + "\n"); log.flush()
     if line == "QUIT":
         break
     f = line.split()
@@ -39,6 +41,7 @@ for line in sys.stdin:
     max_new, keys = int(f[1]), dict(x.split("=", 1) for x in f[2:-1])
     ids = [int(x) for x in f[-1].split(",")]
     tag = f" {keys.get('rid', '0')}" if multi else ""
+    bad = keys.get("rid") == os.environ.get("FAKE_BAD_RID")   # (this conversation's log-probabilities differ)
     reused = shared if shared and ids[:shared] == start[:shared] else 0
     if "shared" in keys:
         shared, start = int(keys["shared"]), ids
@@ -48,7 +51,7 @@ for line in sys.stdin:
         tok = (sum(ids) + i) % 1000 + (1 if n == 2 and i == shift else 0)
         print(f"T{tag} {tok}")
         if "logprobs" in keys:
-            print(f"LP{tag} {tok} -0.1 {tok}:-0.1 999:{-0.1 - gap}")
+            print(f"LP{tag} {tok} {-0.2 if bad else -0.1} {tok}:-0.1 999:{-0.1 - gap}")
     pm = 10 + (len(ids) - reused) * ms_tok
     print(f"DONE{tag} {max_new} {len(ids)} {pm:.1f} {max_new * 10.0:.1f} length 0 0 {reused} 90 100", flush=True)
 '''
@@ -129,9 +132,10 @@ class ByteTok:
         return list(s.encode())
 
 
-def workload(doc_len=4000, prefix=100, sizes=(8, 32), rounds=2):
+def workload(doc_len=4000, prefix=100, sizes=(8, 32), rounds=2, **more):
     chat = lab.Chat(lambda q: "<u>" + q + "<a>", ByteTok())
-    return lab.build_workload(chat, [1000 + i for i in range(doc_len)], prefix, sizes, rounds, mixed=64, quality=32)
+    return lab.build_workload(chat, [1000 + i for i in range(doc_len)], prefix, sizes, rounds, mixed=64, quality=32,
+                              **more)
 
 
 class Workload(unittest.TestCase):
@@ -151,6 +155,60 @@ class Workload(unittest.TestCase):
     def test_too_little_text_is_an_error(self):
         with self.assertRaises(lab.LabError):
             workload(doc_len=150)
+
+    def test_the_optional_steps_keep_the_old_signature_until_asked(self):
+        base = workload()
+        self.assertEqual(base.signature(), workload(mixed2=False, long_read=0, long_answer=0).signature())
+        for more in ({"mixed2": True}, {"long_read": 200}, {"long_answer": 50}):
+            self.assertNotEqual(base.signature(), workload(**more).signature(), more)
+        self.assertNotEqual(workload(long_answer=50).signature(), workload(long_answer=60).signature())
+
+    def test_the_long_read_and_the_second_mixed_read_are_fresh_text(self):
+        w = workload(mixed2=True, long_read=200)
+        self.assertEqual(len(w.long_read) - len(w.mixed_read), 200 - 64)
+        used = [{t for t in x if t >= 1000} for x in (w.mixed_read, w.mixed_read2, w.long_read, w.quality)]
+        for i in range(len(used)):   # (the doc's tokens are 1000 and up; the chat format's bytes below 256)
+            for j in range(i + 1, len(used)):
+                self.assertFalse(used[i] & used[j], (i, j))
+
+
+class CpuHelpers(unittest.TestCase):
+    def test_slices_of_a_steady_answer(self):
+        times = [i * 0.1 for i in range(1, 251)]   # 10 tok/s for 25 s
+        s = lab.slices(times, width=10.0)
+        self.assertEqual(len(s), 2)                 # (0.1-10.1, 10.1-20.1; 20.1-25.0 is under half a slice)
+        self.assertAlmostEqual(s[0][2], 10.0, delta=0.2)
+
+    def test_edges_show_a_drop(self):
+        fast = [i * 0.03 for i in range(1, 1001)]                 # 33 tok/s for 30 s
+        slow = [30 + i * 0.05 for i in range(1, 601)]             # then 20 tok/s for 30 s
+        first, last = lab.edge_rates(fast + slow, span=20.0)
+        self.assertAlmostEqual(first, 33.3, delta=0.5)
+        self.assertAlmostEqual(last, 20.0, delta=0.5)
+        self.assertEqual(lab.edge_rates(fast[:100], span=20.0), (None, None))
+
+    def test_trace_samples_and_summarises(self):
+        with patch.object(lab, "cpu_mhz", lambda: 4000), patch.object(lab, "cpu_temp", lambda: 70), \
+                patch.object(lab, "cpu_energy_uj", side_effect=[0, 50_000_000, 100_000_000, 150_000_000] + [None] * 99):
+            tr = lab.CpuTrace(every=0.05).start()
+            import time as _t
+            _t.sleep(0.3)
+            tr.stop()
+        self.assertGreaterEqual(len(tr.rows), 3)
+        s = tr.between(tr.t0, tr.t0 + 10)
+        self.assertEqual((s["mhz"], s["temp_c"]), (4000, 70))
+        self.assertGreater(s["w"], 0)               # (50 J per ~0.05 s)
+        self.assertEqual(lab.cpu_text({}), "-")
+
+    def test_trace_without_readable_files(self):
+        with patch.object(lab, "cpu_mhz", side_effect=OSError), patch.object(lab, "cpu_temp", side_effect=OSError), \
+                patch.object(lab, "cpu_energy_uj", lambda: None):
+            tr = lab.CpuTrace(every=0.05).start()
+            import time as _t
+            _t.sleep(0.12)
+            tr.stop()
+        self.assertTrue(tr.rows)
+        self.assertEqual(tr.between(tr.t0, tr.t0 + 10), {})
 
 
 class Runs(unittest.TestCase):
@@ -243,6 +301,40 @@ class Runs(unittest.TestCase):
         self.assertEqual(len(res["answers"][1]["tokens"]), 64)   # (the other conversation's T line left out)
         self.assertIn("mixed_read", res["metrics"])               # (the mixed step: one decodes, one reads)
         self.assertIn("mixed_decode", res["metrics"])
+
+    def test_two_answers_while_a_prompt_is_read(self):
+        self.w = workload(doc_len=6000, prefix=200, sizes=(16, 256), mixed2=True)
+        code, res, _ = self.go(FAKE_MULTI=1)
+        self.assertEqual(code, 0)
+        for m in ("mixed_read", "mixed2_read", "mixed2_decode", "mixed2_gap"):
+            self.assertIn(m, res["metrics"])
+        self.assertTrue(res["mixed_read_lp"])                     # (the read's token and its log-probabilities)
+
+    def test_a_long_read_and_a_long_answer(self):
+        self.w = workload(doc_len=6000, prefix=200, sizes=(16, 256), long_read=300, long_answer=80)
+        opts = lab.Opts(answer=64, request_timeout=5.0, deadline=60.0, end_ids=(7, 9))
+        code, res, _ = self.go(opts=opts)
+        self.assertEqual(code, 0)
+        self.assertIn("read_long", res["metrics"])
+        self.assertIn("long_decode", res["metrics"])
+        self.assertEqual(res["long_answer"]["tokens"], 80)
+        self.assertEqual(len(res["long_answer"]["times"]), 80)
+        self.assertIn("logit_bias=7:-100,9:-100", Path(self.tmp.name, "gen.log").read_text())
+
+    def test_the_pause_check_passes_when_the_reads_agree(self):
+        self.w = workload(doc_len=6000, prefix=200, sizes=(16, 256), pause_check=True)
+        code, res, _ = self.go(FAKE_MULTI=1)
+        self.assertEqual(code, 0, res.get("stopped"))
+        pc = res["pause_check"]
+        self.assertTrue(pc["read_same"] and pc["answer_same"])
+        self.assertEqual(pc["answer_tokens"], [256, 256])
+
+    def test_the_pause_check_stops_on_a_different_read(self):
+        self.w = workload(doc_len=6000, prefix=200, sizes=(16, 256), pause_check=True)
+        code, res, _ = self.go(FAKE_MULTI=1, FAKE_BAD_RID=8)
+        self.assertEqual(code, 4)
+        self.assertFalse(res["pause_check"]["read_same"])
+        self.assertIn("pause check", res["stopped"])
 
     def test_one_conversation_skips_the_mixed_step(self):
         code, res, _ = self.go()

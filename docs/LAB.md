@@ -65,3 +65,22 @@ Every run writes its JSON (settings, metrics, verdicts, conditions) and the engi
 
 - Every `lab_matrix` plan starts with one unmeasured run (`m-<name>-warmup`; `"warmup": false` in the spec drops it): the first run after the server served a while decoded its first answers ~35% faster (31 vs 20-22 tok/s, base-w and base-c), which would pull whichever configuration ran first up. Hand-written queues do the same.
 - `lab.py run` waits until the 1-minute load is below `--calm-load` (1.0) before it starts, up to `--calm-wait` (300 s), and stops with the reason if the box stays busy. `calm_wait_s` in the result says how long it waited.
+
+## The lane file, the CPU trace and the longer steps (2026-11-09)
+
+- `--lane-cal FILE`: each run starts from its own copy of one frozen PCIe-lane times file (`DS4_LANE_CAL`). The engine
+  keeps its lane verdict ("it no longer streams them, kept for the next start") in the pack's `lane-times.txt`, which
+  the server and every run share, keyed by the build: without a frozen copy, a run inherits what the run before decided.
+- The CPU trace (`--cpu-every`, 1 s; 0: none): the CPU's mean clock, package temperature and - where intel-rapl's
+  `energy_uj` is readable (root only by default) - its power, for the whole run (`res["cpu"]`), and beside each
+  answer's tokens/s in the log. On synthax the CPU may draw 250 W for ~55 s, then 125 W (intel-rapl's two limits).
+- `--long-answer N`: one answer of N tokens, its end tokens banned, last in the run: `long_decode` (whole),
+  `long_decode_start` / `long_decode_end` (its first and last 20 s) and its 10 s slices with the CPU beside them
+  (`res["long_answer"]["slices"]`) - an answer that outlasts a power limit's burst.
+- `--long-read N`: a fresh prompt of N tokens after the mixed steps (`read_long`): where the chunk size and the borrowed
+  room show.
+- `--mixed2`: a second mixed step, two conversations answering while a third reads 4K new tokens (`mixed2_decode`,
+  `mixed2_read`, `mixed2_gap`; `--parallel 3`).
+- The mixed reads ask for their one token's top 5 log-probabilities (`res["mixed_read_lp"]`): the prompt pass of a read
+  that paused between its layers (DS4_LAYER_YIELD) against one that did not, to the last digit.
+- The signature covers these steps only when they are asked for: runs without them compare with older runs as before.

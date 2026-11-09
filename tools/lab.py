@@ -39,11 +39,13 @@ and the engine's log a run. Standard library only.
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
 import math
 import queue
 import re
+import shutil
 import statistics as st
 import subprocess
 import sys
@@ -67,11 +69,17 @@ ANSWER = 128                        # tokens an answer writes
 LONG_ANSWER = 64                    # tokens the answer to the shared start writes (a long prompt's answer, gated too)
 MIXED_READ = 4096                   # the mixed step's read, while another conversation decodes
 MIXED_ANSWER = 256                  # ... that conversation's answer
+LONG_Q = ("Write a long, detailed handbook for someone opening a small bakery: the equipment, the suppliers, the "
+          "daily schedule, the recipes, the costs, the staff, the mistakes to avoid. Cover every part in depth.")
+END_TOKENS = ("<｜end▁of▁sentence｜>", "<｜User｜>", "<|im_end|>", "<|endoftext|>", "<|user|>", "<|observation|>",
+              "[e~[", "]~b]")   # (the server's stop tokens, serve/server.py)   # (banned: --long-answer runs to length)
+SLICE_S = 10.0                      # the long answer's speed, slice by slice
+EDGE_S = 20.0                       # ... and over its first and last seconds
 QUALITY = 1024                      # the quality text's tokens (lab_quality.py)
 NEAR_TIE = 0.5                      # nats between the reference's two likeliest tokens: a divergence there is a near-tie
 LAST_BITS = 0.05                    # mean |change| of the common tokens' log-probabilities for `last bits`
 NOISE = {"read": 0.10, "decode": 0.08}   # the spread assumed for a side of one value, of its mean
-ABS_FLOOR = {"mixed_decode": 1.0}        # a difference smaller than this never counts (a metric near zero: 0.2 -> 0.4)
+ABS_FLOOR = {"mixed_decode": 1.0, "mixed2_decode": 1.0}   # a difference smaller than this never counts (near zero)
 LEVELS = ("changed", "last bits", "identical")
 
 
@@ -127,6 +135,12 @@ class Workload:
     quality: list[int] = field(default_factory=list)      # BOS + the quality text (lab_quality.py)
     warm_read: list[int] = field(default_factory=list)    # an unmeasured read before the measured ones (the first read
                                                           # after the shared start ran ~0.4-0.9 s slow in half the runs)
+    # the steps a run asks for (--mixed2, --long-read, --long-answer); none: the signature as before they existed
+    mixed_read2: list[int] = field(default_factory=list)  # the mixed step's read with two conversations answering
+    long_read: list[int] = field(default_factory=list)    # a long fresh prompt
+    long_q: list[int] = field(default_factory=list)       # a question whose answer runs to long_n tokens
+    long_n: int = 0
+    check_read: list[int] = field(default_factory=list)   # --pause-check: a fresh prompt read alone, then beside an answer
 
     def signature(self) -> str:
         h = hashlib.sha256()
@@ -134,17 +148,22 @@ class Workload:
                     self.mixed_read, self.quality, self.warm_read]:
             h.update(",".join(map(str, ids)).encode())
             h.update(b";")
+        for name, ids in (("mixed2", self.mixed_read2), ("long_read", self.long_read),
+                          (f"long_answer {self.long_n}", self.long_q), ("pause_check", self.check_read)):
+            if ids:
+                h.update(f"{name}:".encode() + ",".join(map(str, ids)).encode() + b";")
         return h.hexdigest()[:16]
 
 
 def build_workload(chat, doc: list[int], prefix: int = PREFIX, sizes=READS, rounds: int = 2, mixed: int = MIXED_READ,
-                   quality: int = QUALITY) -> Workload:
+                   quality: int = QUALITY, mixed2: bool = False, long_read: int = 0, long_answer: int = 0,
+                   pause_check: bool = False) -> Workload:
     """The requests of a run from `chat` (a question -> its prompt's ids, in the model's chat format, thinking off) and
     `doc` (the text the reads take their tokens from): the same every run of the same arguments. The reads' new text,
-    the mixed step's read and the quality text come from slices of `doc` nothing else uses, so nothing but the shared
-    start can be reused."""
+    the mixed steps' reads, the long read and the quality text come from slices of `doc` nothing else uses, so nothing
+    but the shared start can be reused."""
     before, after = chat.split_ids()
-    need = prefix + rounds * sum(sizes) + mixed + quality + 32
+    need = prefix + rounds * sum(sizes) + mixed * (1 + mixed2 + pause_check) + long_read + quality + 32
     if len(doc) < need:
         raise LabError(f"the text for the reads has {len(doc)} tokens, they need {need}: fewer --reads or --rounds")
     start = before + doc[:prefix]
@@ -154,12 +173,26 @@ def build_workload(chat, doc: list[int], prefix: int = PREFIX, sizes=READS, roun
         for n in sizes:
             reads.append((n, start + doc[at:at + n] + ask))
             at += n
-    mixed_read = before + doc[at:at + mixed] + ask
-    at += mixed
+    def fresh(n: int) -> list[int]:   # (a prompt of n new tokens nothing else reads)
+        nonlocal at
+        at += n
+        return before + doc[at - n:at] + ask
+
+    mixed_read = fresh(mixed)
     qtext = before[:1] + doc[at:at + quality]
     at += quality
-    return Workload(chat(WARMUP), [chat(q) for q in QUESTIONS], start + ask, reads, len(start), chat(MIXED_Q),
-                    mixed_read, qtext, start + doc[at:at + 16] + ask)
+    w = Workload(chat(WARMUP), [chat(q) for q in QUESTIONS], start + ask, reads, len(start), chat(MIXED_Q),
+                 mixed_read, qtext, start + doc[at:at + 16] + ask)
+    at += 16
+    if mixed2:
+        w.mixed_read2 = fresh(mixed)
+    if long_read:
+        w.long_read = fresh(long_read)
+    if long_answer:
+        w.long_q, w.long_n = chat(LONG_Q), long_answer
+    if pause_check:
+        w.check_read = fresh(mixed)
+    return w
 
 
 class Chat:
@@ -233,9 +266,9 @@ def judge(new: list[float], ref: list[float], higher_better: bool, rel: float, f
 
 
 def metric_kind(name: str) -> tuple[bool, float]:
-    """(higher is better, the assumed spread) of a metric by its name: decode / mixed_decode in tokens/s, the rest
-    (read*, turn, mixed_read, mixed_gap) in ms."""
-    return (True, NOISE["decode"]) if name in ("decode", "mixed_decode") else (False, NOISE["read"])
+    """(higher is better, the assumed spread) of a metric by its name: the decodes (decode, mixed_decode, mixed2_decode,
+    long_decode*) in tokens/s, the rest (read*, turn, mixed_read, mixed_gap) in ms."""
+    return (True, NOISE["decode"]) if "decode" in name else (False, NOISE["read"])
 
 
 # ---------------------------------------------------------------- real traffic's weights (pure)
@@ -284,6 +317,137 @@ def wait_calm(limit: float, most: float, every: float = 5.0) -> float:
     return time.time() - t
 
 
+def cpu_mhz() -> int | None:
+    """The CPU's mean clock over its threads now (Linux /proc/cpuinfo)."""
+    mhz = [float(x.split(":")[1]) for x in Path("/proc/cpuinfo").read_text().splitlines() if x.startswith("cpu MHz")]
+    return round(st.fmean(mhz)) if mhz else None
+
+
+@functools.cache
+def cpu_temp_file() -> Path | None:
+    for hw in Path("/sys/class/hwmon").glob("hwmon*"):
+        if (hw / "name").exists() and (hw / "name").read_text().strip() in ("coretemp", "k10temp"):
+            return hw / "temp1_input"
+    return None
+
+
+def cpu_temp() -> int | None:
+    """The CPU package's temperature (hwmon coretemp / k10temp temp1: Intel's package, AMD's Tctl), None without one."""
+    f = cpu_temp_file()
+    return int(f.read_text()) // 1000 if f else None
+
+
+RAPL = Path("/sys/class/powercap/intel-rapl:0/energy_uj")   # (the package's energy - root only by default since 2020)
+
+
+def cpu_energy_uj() -> int | None:
+    try:
+        return int(RAPL.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+class CpuTrace:
+    """The CPU's mean clock, package temperature and - where intel-rapl's energy is readable - its power, every `every`
+    seconds on a thread for the whole run: what a decode speed that drifts within a run moves with (a power limit
+    ending its burst, heat). rows: [seconds since the start, MHz, °C, W] (None: not readable)."""
+
+    def __init__(self, every: float = 1.0):
+        self.every, self.rows, self.t0 = every, [], time.time()
+        self._stop = threading.Event()
+        self._th = threading.Thread(target=self._loop, daemon=True)
+
+    def start(self) -> "CpuTrace":
+        self._th.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._th.join(timeout=5.0)
+
+    def _loop(self) -> None:
+        last = None
+        while not self._stop.is_set():
+            t, row = time.time(), [None, None, None]
+            for i, part in enumerate((cpu_mhz, cpu_temp)):   # (each on its own, as conditions())
+                try:
+                    row[i] = part()
+                except (OSError, ValueError, IndexError):
+                    pass
+            uj = cpu_energy_uj()
+            if uj is not None and last is not None and uj >= last[1] and t > last[0]:
+                row[2] = round((uj - last[1]) / 1e6 / (t - last[0]), 1)
+            last = (t, uj) if uj is not None else None
+            self.rows.append([round(t - self.t0, 2)] + row)
+            self._stop.wait(self.every)
+
+    def between(self, a: float, b: float) -> dict:
+        """The mean clock, the highest temperature and the mean power of the samples from time a to b (time.time())."""
+        rows = [r for r in self.rows if a - self.t0 <= r[0] <= b - self.t0]
+        col = lambda i: [r[i] for r in rows if r[i] is not None]   # noqa: E731
+        out = {}
+        if col(1):
+            out["mhz"] = round(st.fmean(col(1)))
+        if col(2):
+            out["temp_c"] = max(col(2))
+        if col(3):
+            out["w"] = round(st.fmean(col(3)), 1)
+        return out
+
+
+def cpu_text(s: dict) -> str:
+    return " ".join(x for x in (f"{s['mhz']} MHz" if "mhz" in s else "", f"{s['temp_c']} °C" if "temp_c" in s else "",
+                                f"{s['w']} W" if "w" in s else "") if x) or "-"
+
+
+def slices(times: list[float], width: float = SLICE_S) -> list[tuple[float, float, float]]:
+    """A long answer's token times (time.time()) -> (start, end, tokens/s) of each `width`-second slice from its first
+    token on (the last one only when it is at least half as wide)."""
+    if len(times) < 2:
+        return []
+    out, a = [], times[0]
+    while a < times[-1]:
+        b = min(a + width, times[-1])
+        n = sum(1 for t in times if a < t <= b)
+        if b - a >= width / 2:
+            out.append((a, b, n / (b - a)))
+        a = b
+    return out
+
+
+def edge_rates(times: list[float], span: float = EDGE_S) -> tuple[float | None, float | None]:
+    """A long answer's tokens/s over its first and its last `span` seconds (None: the answer was shorter than 2 spans)."""
+    if len(times) < 2 or times[-1] - times[0] < 2 * span:
+        return None, None
+    first = sum(1 for t in times if times[0] < t <= times[0] + span) / span
+    last = sum(1 for t in times if times[-1] - span < t <= times[-1]) / span
+    return first, last
+
+
+def cpu_summary(res: dict, trace: CpuTrace) -> None:
+    """The CPU trace into the run's results, and beside the speeds it may explain: each answer's tokens/s with the
+    CPU's clock / temperature / power meanwhile, and the long answer's slices likewise."""
+    res["cpu"] = {"every": trace.every, "rows": trace.rows}
+    wins = (res.get("cpu_windows") or {}).get("answers") or []
+    if wins:
+        res["cpu"]["answers"] = [trace.between(a, b) for a, b in wins]
+        rates = (res.get("cpu_windows") or {}).get("rates") or []
+        say("cpu during the answers: " + " | ".join(
+            (f"{rates[i]:.1f} tok/s " if i < len(rates) and rates[i] is not None else "") + cpu_text(s)
+            for i, s in enumerate(res["cpu"]["answers"])))
+    la = res.get("long_answer")
+    if la and la.get("t0") is not None:
+        times = [la["t0"] + t for t in la["times"]]
+        rows, texts = [], []
+        for a, b, rate in slices(times):
+            s = trace.between(a, b)
+            rows.append([round(a - times[0], 1), round(b - times[0], 1), round(rate, 2), s.get("mhz"), s.get("temp_c"),
+                         s.get("w")])
+            texts.append(f"{a - times[0]:.0f}-{b - times[0]:.0f} s {rate:.1f} tok/s {cpu_text(s)}")
+        la["slices"] = rows
+        say("long answer, slice by slice: " + " | ".join(texts))
+
+
 def conditions() -> dict:
     """What else could move a run's numbers, read before and after it (Linux; what is missing stays out): the GPU's
     clock, memory clock, temperature and power (amdgpu sysfs), the CPU's mean clock, the load and the free RAM."""
@@ -304,9 +468,10 @@ def conditions() -> dict:
             return
 
     def cpu(out):
-        mhz = [float(x.split(":")[1]) for x in Path("/proc/cpuinfo").read_text().splitlines() if x.startswith("cpu MHz")]
-        if mhz:
-            out["cpu_mhz"] = round(st.fmean(mhz))
+        if (mhz := cpu_mhz()) is not None:
+            out["cpu_mhz"] = mhz
+        if (temp := cpu_temp()) is not None:
+            out["cpu_temp_c"] = temp
 
     def load(out):
         out["load1"] = load1()
@@ -341,6 +506,7 @@ class Engine:
             raise LabError(f"the engine did not start ({cmd[0]}): {e}") from None
         self.q: queue.Queue = queue.Queue()
         self.multi = False
+        self.slots = 1
         threading.Thread(target=self._pump, daemon=True).start()
 
     def _pump(self):
@@ -367,9 +533,12 @@ class Engine:
             line = self.line(until)
             if line.startswith("READY"):
                 self.multi = any(w.startswith("multi=") for w in line.split())
+                self.slots = next((int(w[6:]) for w in line.split() if w.startswith("multi=")), 1)
                 return
 
-    def gen(self, ids: list[int], max_new: int, timeout: float, **keys) -> tuple[Done, Answer]:
+    def gen(self, ids: list[int], max_new: int, timeout: float, times: list[float] | None = None,
+            **keys) -> tuple[Done, Answer]:
+        """One request; `times` (if given) gets each token's arrival (time.time())."""
         kv = " ".join(f"{k}={v}" for k, v in keys.items())
         rid = " rid=0" if self.multi else ""
         self.p.stdin.write(f"GEN {max_new} temperature=0{rid} {kv} " + ",".join(map(str, ids)) + "\n")
@@ -382,6 +551,8 @@ class Engine:
             if f[0] == "ERR":
                 raise LabError("the engine refused a request: " + " ".join(f[1:]))
             if f[0] == "T":
+                if times is not None:
+                    times.append(time.time())
                 ans.tokens.append(int(f[-1]))
             elif f[0] == "LP":
                 _, lp, top = parse_lp(f, self.multi)
@@ -390,47 +561,121 @@ class Engine:
             else:
                 return parse_done(f, self.multi), ans
 
-    def mixed(self, decode_ids: list[int], read_ids: list[int], n_decode: int, timeout: float) -> dict:
-        """One conversation (rid 1) answers while another (rid 2) reads a fresh prompt: the read starts once the answer
-        has 16 tokens. -> the answer's tokens/s while the read runs and after it, and the read's time. Needs an engine
-        of several conversations (--parallel 2 or more)."""
+    def mixed(self, decodes: list[list[int]], read_ids: list[int], n_decode: int, timeout: float) -> dict:
+        """Conversations answer (rids 1, 3, ...: one per prompt of `decodes`) while another (rid 2) reads a fresh
+        prompt: the read starts once every answer has 16 tokens. -> the answers' mean tokens/s while the read runs and
+        after it, the read's time, and the longest pause of any answer. Needs an engine of several conversations
+        (--parallel 2 or more; one more than the answers)."""
         if not self.multi:
             raise LabError("the mixed step needs an engine of several conversations (--parallel 2 or more)")
-        # both request lines built before the clock starts: the read is sent mid-answer, inside the timed window
-        lines = {rid: f"GEN {n} temperature=0 rid={rid} " + ",".join(map(str, ids)) + "\n"
-                 for rid, n, ids in ((1, n_decode, decode_ids), (2, 1, read_ids))}
+        rids = [1] + list(range(3, 2 + len(decodes)))
+        # every request line built before the clock starts: the read is sent mid-answer, inside the timed window
+        lines = {rid: f"GEN {n_decode} temperature=0 rid={rid} " + ",".join(map(str, ids)) + "\n"
+                 for rid, ids in zip(rids, decodes)}
+        # (the read's one token with its top log-probabilities: a prompt read with pauses between its layers against
+        #  one without - the same row, to the last digit, or the pauses moved what it computes)
+        lines[2] = "GEN 1 temperature=0 rid=2 logprobs=5 " + ",".join(map(str, read_ids)) + "\n"
         send = lambda rid: (self.p.stdin.write(lines[rid]), self.p.stdin.flush())   # noqa: E731
         until = time.time() + timeout
-        send(1)
-        toks, t_read, t_read_done, read_ms, done1 = [], None, None, None, None
-        while done1 is None or read_ms is None:
+        for rid in rids:
+            send(rid)
+        toks = {str(rid): [] for rid in rids}
+        done: dict[str, float] = {}
+        t_read, t_read_done, read_ms, read_lp = None, None, None, None
+
+        def maybe_read():   # (once every answer has 16 tokens, or is done)
+            nonlocal t_read
+            if t_read is None and all(len(v) >= 16 or k in done for k, v in toks.items()):
+                t_read = time.time()
+                send(2)
+
+        while len(done) < len(rids) or read_ms is None:
             f = self.line(until).split()
-            if not f or f[0] not in ("T", "DONE", "ERR") or len(f) < 2:
+            if not f or f[0] not in ("T", "LP", "DONE", "ERR") or len(f) < 2:
                 continue
             if f[0] == "ERR":
-                raise LabError("the engine refused a mixed-step request: " + " ".join(f[1:]))
-            if f[0] == "T" and f[1] == "1":
-                toks.append(time.time())
-                if len(toks) == 16 and t_read is None:
-                    t_read = time.time()
-                    send(2)
+                raise LabError("the mixed step: the engine refused a request: " + " ".join(f[1:]))
+            if f[0] == "LP" and f[1] == "2":
+                read_lp = f[2:]
+            elif f[0] == "T" and f[1] in toks:
+                toks[f[1]].append(time.time())
+                maybe_read()
             elif f[0] == "DONE" and f[1] == "2":
                 t_read_done, read_ms = time.time(), parse_done(f, True).prompt_ms
-            elif f[0] == "DONE" and f[1] == "1":
-                done1 = time.time()
-                if t_read is None:   # (an answer of under 16 tokens: the read goes alone)
-                    t_read = time.time()
-                    send(2)
-        during = [t for t in toks if t_read <= t <= t_read_done]
-        after = [t for t in toks if t > t_read_done]
+            elif f[0] == "DONE" and f[1] in toks:
+                done[f[1]] = time.time()
+                maybe_read()   # (answers of under 16 tokens: the read goes when they are done)
         rate = lambda ts, a, b: len(ts) / (b - a) if ts and b > a else None   # noqa: E731
-        # the answer's longest pause while the other prompt was read: its last token before the read began (or the
-        # read's start) to the next one - what someone watching that answer sees as a freeze
-        marks = [max([t for t in toks if t < t_read] or [t_read])] + during + [t for t in after[:1]]
-        gap = max((b - a for a, b in zip(marks, marks[1:])), default=None)
-        return {"mixed_read": read_ms, "mixed_decode": rate(during, t_read, t_read_done),
-                "mixed_decode_after": rate(after, t_read_done, done1),
-                "mixed_gap": gap * 1000.0 if gap is not None else None}
+        during_rates, after_rates, gaps = [], [], []
+        for k, ts in toks.items():
+            if done[k] <= t_read:   # (done before the read began: not an answer beside it)
+                continue
+            during = [t for t in ts if t_read <= t <= t_read_done]
+            after = [t for t in ts if t > t_read_done]
+            during_rates.append(rate(during, t_read, min(t_read_done, done[k])))
+            after_rates.append(rate(after, t_read_done, done[k]))
+            # the answer's longest pause while the other prompt was read: its last token before the read began (or
+            # the read's start) to the next one - what someone watching that answer sees as a freeze
+            marks = [max([t for t in ts if t < t_read] or [t_read])] + during + after[:1]
+            gaps += [b - a for a, b in zip(marks, marks[1:])]
+        mean = lambda v: st.fmean([x for x in v if x is not None]) if any(x is not None for x in v) else None   # noqa: E731
+        return {"read": read_ms, "decode": mean(during_rates), "decode_after": mean(after_rates),
+                "gap": max(gaps) * 1000.0 if gaps else None, "read_lp": read_lp}
+
+    def together(self, first: dict[str, str], later: dict[str, str], timeout: float) -> dict:
+        """Requests by rid: `first` (rid -> GEN line) sent now, `later` once every first one has 16 tokens or is done.
+        -> per rid: its tokens, its LP lines as sent (the digits as the engine wrote them) and its Done."""
+        out = {rid: {"tokens": [], "lp": [], "done": None} for rid in [*first, *later]}
+        send = lambda line: (self.p.stdin.write(line), self.p.stdin.flush())   # noqa: E731
+        until = time.time() + timeout
+        for line in first.values():
+            send(line)
+        pending = dict(later)
+        while any(v["done"] is None for v in out.values()):
+            if pending and all(len(out[r]["tokens"]) >= 16 or out[r]["done"] is not None for r in first):
+                for line in pending.values():
+                    send(line)
+                pending = {}
+                continue
+            f = self.line(until).split()
+            if not f or f[0] not in ("T", "LP", "DONE", "ERR") or len(f) < 2 or f[1] not in out:
+                continue
+            if f[0] == "ERR":
+                raise LabError("the engine refused a request: " + " ".join(f[1:]))
+            o = out[f[1]]
+            if f[0] == "T":
+                o["tokens"].append(int(f[-1]))
+            elif f[0] == "LP":
+                o["lp"].append(" ".join(f[2:]))
+            else:
+                o["done"] = parse_done(f, True)
+        return out
+
+    def pause_check(self, read_ids: list[int], answer_ids: list[int], n_answer: int, timeout: float,
+                    flush: list[list[int]]) -> dict:
+        """Does a prompt read that pauses between its layers (DS4_LAYER_YIELD) compute what the same read alone does? In
+        this one engine (with --no-expert-cache nothing moves between the reads): the prompt read alone and an answer
+        alone; before those and again after them, every conversation slot takes an unrelated short prompt of `flush`
+        (one a slot: the scheduler gives a request the idle slot it shares the most with, which would hand a read
+        an earlier one's state); then the same answer with the same prompt read meanwhile in another conversation. -> whether the read's
+        top log-probabilities and the answer's tokens and log-probabilities match, each to the last digit, and the
+        tokens each reused (a read or an answer that reused any is no full read: not comparable)."""
+        line = lambda rid, n, ids, k: f"GEN {n} temperature=0 rid={rid} logprobs={k} " + ",".join(map(str, ids)) + "\n"   # noqa: E731
+        def flush_slots(base: int) -> None:   # (every slot an unrelated prompt: nothing left to reuse)
+            for i, ids in enumerate(flush):
+                self.together({str(base + i): line(base + i, 1, ids, 0)}, {}, timeout)
+
+        flush_slots(20)
+        alone = self.together({"5": line(5, 1, read_ids, 5)}, {}, timeout)["5"]
+        ans = self.together({"6": line(6, n_answer, answer_ids, 2)}, {}, timeout)["6"]
+        flush_slots(30)
+        both = self.together({"7": line(7, n_answer, answer_ids, 2)}, {"8": line(8, 1, read_ids, 5)}, timeout)
+        read2, ans2 = both["8"], both["7"]
+        k = next((i for i, (a, b) in enumerate(zip(ans["lp"], ans2["lp"])) if a != b), None)
+        return {"read_same": alone["lp"] == read2["lp"], "read_alone": alone["lp"], "read_paused": read2["lp"],
+                "reused": [alone["done"].reused, read2["done"].reused, ans["done"].reused, ans2["done"].reused],
+                "answer_same": ans["tokens"] == ans2["tokens"] and ans["lp"] == ans2["lp"],
+                "answer_first_diff": k, "answer_tokens": [len(ans["tokens"]), len(ans2["tokens"])]}
 
     def close(self) -> None:
         try:
@@ -504,6 +749,7 @@ class Opts:
     deadline: float = 900.0
     weights: dict = field(default_factory=dict)   # read size -> share of real turns (TTFT per turn)
     mixed: bool = True
+    end_ids: tuple = ()                            # the tokens that end an answer (banned in the long answer)
 
 
 class Run:
@@ -576,12 +822,17 @@ def measure(eng: Engine, w: Workload, r: Run, prof=None) -> int:
             prof.pid = engine_pid(eng.p.pid, Path(eng.exe).name)
         _, ans = eng.gen(w.warm, 32, left(), logprobs=2)
         answers, rates = [ans], []
+        res["cpu_windows"] = {"answers": [], "rates": []}   # (each answer's start, end and speed, for the CPU trace)
         with step("answers"):
             for q in w.questions:
+                t_a = time.time()
                 done, ans = eng.gen(q, o.answer, left(), logprobs=2)
+                res["cpu_windows"]["answers"].append([t_a, time.time()])
                 answers.append(ans)
-                if done.produced >= min(64, o.answer) and done.decode_ms > 0:
-                    rates.append(done.produced / done.decode_ms * 1000.0)
+                rate = done.produced / done.decode_ms * 1000.0 if done.decode_ms > 0 else None
+                res["cpu_windows"]["rates"].append(rate)
+                if done.produced >= min(64, o.answer) and rate is not None:
+                    rates.append(rate)
         # the shared start, read cold, and its answer (a long prompt's: the prompt skip of 3.7K tokens and more acts)
         done, ans = eng.gen(w.prefix, LONG_ANSWER, left(), shared=w.shared, logprobs=2)
         answers.append(ans)
@@ -617,16 +868,64 @@ def measure(eng: Engine, w: Workload, r: Run, prof=None) -> int:
         t = turn_ms(by_n, o.weights)
         if t is not None and not r.check("turn", [t]):
             return 3
-        if o.mixed and eng.multi:
-            with step("mixed"):
-                mx = eng.mixed(w.mixed_q, w.mixed_read, MIXED_ANSWER, left())
-            if mx["mixed_decode_after"]:
-                res["metrics"]["mixed_decode_after"] = [mx["mixed_decode_after"]]
-            for name in ("mixed_decode", "mixed_read", "mixed_gap"):
-                if mx[name] is not None and not r.check(name, [mx[name]]):
+        # the mixed steps: one answer (and with --mixed2 two) while a fresh prompt is read
+        for name, decodes, read_ids in (("mixed", [w.mixed_q], w.mixed_read),
+                                        ("mixed2", [w.mixed_q, w.questions[0]], w.mixed_read2)):
+            if not o.mixed or not read_ids:
+                continue
+            if not eng.multi:
+                say(f"{name}: skipped - the engine runs one conversation (--parallel 1)")
+                continue
+            if eng.slots < len(decodes) + 1:
+                say(f"{name}: skipped - it needs --parallel {len(decodes) + 1}, the engine runs {eng.slots}")
+                continue
+            with step(name):
+                mx = eng.mixed(decodes, read_ids, MIXED_ANSWER, left())
+            if mx["decode_after"]:
+                res["metrics"][f"{name}_decode_after"] = [mx["decode_after"]]
+            if mx["read_lp"]:
+                res[f"{name}_read_lp"] = mx["read_lp"]
+            for part in ("decode", "read", "gap"):
+                if mx[part] is not None and not r.check(f"{name}_{part}", [mx[part]]):
                     return 3
-        elif o.mixed:
-            say("mixed: skipped - the engine runs one conversation (--parallel 1)")
+        if w.long_read:   # (a long fresh prompt: the chunks' size and what they borrow show at this length)
+            with step("long_read"):
+                done, _ = eng.gen(w.long_read, 1, left())
+            if not r.check("read_long", [done.prompt_ms]):
+                return 3
+        if w.check_read:   # (a paused read against the same read alone, to the last digit: a gate)
+            if not eng.multi or eng.slots < 2 or eng.slots > 1 + len(w.questions):
+                say(f"pause check: skipped - it needs 2 to {1 + len(w.questions)} conversations (--parallel), the engine runs {eng.slots}")
+            else:
+                with step("pause_check"):
+                    pc = eng.pause_check(w.check_read, w.mixed_q, MIXED_ANSWER, max(left(), 3 * o.request_timeout),
+                                         [w.warm, *w.questions][:max(eng.slots, 1)])
+                res["pause_check"] = pc
+                ok = pc["read_same"] and pc["answer_same"] and not any(pc["reused"])
+                say(f"pause check: the read {'the same' if pc['read_same'] else 'DIFFERENT'} "
+                    f"({' / '.join(x.split()[0] + ' ' + x.split()[1] for x in pc['read_alone'][:1] + pc['read_paused'][:1])}), "
+                    f"the answer {'the same' if pc['answer_same'] else 'DIFFERENT from token ' + str(pc['answer_first_diff'])}"
+                    + (f", reused {pc['reused']} - not comparable" if any(pc["reused"]) else ""))
+                if not ok:
+                    res["stopped"] = ("pause check: a read reused tokens, not comparable" if any(pc["reused"]) else
+                                      "pause check: a paused read or the answer beside it differs")
+                    return 4
+        if w.long_q:      # (one answer past a CPU power limit's burst: its speed slice by slice, the CPU's beside it)
+            times: list[float] = []
+            keys = {"logit_bias": ",".join(f"{i}:-100" for i in o.end_ids)} if o.end_ids else {}
+            allow = max(1.0, min(deadline - time.time(), max(o.request_timeout, w.long_n / 5.0)))   # (>= 5 tok/s)
+            with step("long_answer"):
+                done, _ = eng.gen(w.long_q, w.long_n, allow, times=times, **keys)
+            res["long_answer"] = {"tokens": done.produced, "t0": times[0] if times else None,
+                                  "times": [round(t - times[0], 3) for t in times]}
+            if done.produced < w.long_n:
+                say(f"long answer: {done.produced} of {w.long_n} tokens ({done.finish}) - the end tokens were not "
+                    "all banned")
+            first, last = edge_rates(times)
+            for name, v in (("long_decode", done.produced / done.decode_ms * 1000.0 if done.decode_ms > 0 else None),
+                            ("long_decode_start", first), ("long_decode_end", last)):
+                if v is not None and not r.check(name, [v]):
+                    return 3
         return 0
     except LabError as e:
         res["error"] = str(e)
@@ -656,7 +955,12 @@ def run(a) -> int:
     text = (Path(a.text).read_text(encoding="utf-8", errors="replace") if a.text else
             "\n\n".join(p.read_text(encoding="utf-8", errors="replace")
                         for p in [ROOT / "README.md"] + sorted((ROOT / "docs").glob("*.md")) if p.exists()))
-    w = build_workload(chat, tok.encode(text), a.prefix, tuple(int(x) for x in a.reads.split(",")), a.rounds)
+    w = build_workload(chat, tok.encode(text), a.prefix, tuple(int(x) for x in a.reads.split(",")), a.rounds,
+                       mixed2=a.mixed2, long_read=a.long_read, long_answer=a.long_answer, pause_check=a.pause_check)
+    end_ids = tuple(sorted({i[0] for s in END_TOKENS if len(i := tok.encode(s, parse_special=True)) == 1}))
+    if a.long_answer and not end_ids:
+        raise SystemExit(f"--long-answer: the tokenizer knows none of {', '.join(END_TOKENS)} - the answer could end "
+                         "early, and its speed past the CPU's burst would go unmeasured")
     sig = w.signature()
     runs = Path(a.runs)
     ref = load_runs(runs, a.against, sig) if a.against else []
@@ -672,7 +976,15 @@ def run(a) -> int:
         (f" {' '.join(a.arg)}" if a.arg else "") + (f", against '{a.against}' ({len(ref)} runs)" if ref else ""))
     weights = {int(k): float(v) for k, v in json.loads(Path(a.weights).read_text(encoding="utf-8")).items()} \
         if a.weights else {}
-    o = Opts(a.gate, a.keep_going, a.answer, a.load_timeout, a.request_timeout, a.deadline, weights, not a.no_mixed)
+    o = Opts(a.gate, a.keep_going, a.answer, a.load_timeout, a.request_timeout, a.deadline, weights, not a.no_mixed,
+             end_ids)
+    if a.lane_cal:
+        # (DeepSeek: the PCIe lane's times file - the engine keeps its verdict there for the next start, by default the
+        #  pack's lane-times.txt, which the server and every run share: each run starts from its own copy of one file)
+        lane = runs / a.label / f"{stamp}-lane-times.txt"
+        shutil.copyfile(a.lane_cal, lane)
+        env["DS4_LANE_CAL"] = str(lane.resolve())
+        res["lane_cal"] = str(Path(a.lane_cal).resolve())
     if a.calm_load > 0:
         waited = wait_calm(a.calm_load, a.calm_wait)
         res["calm_wait_s"] = round(waited)
@@ -692,6 +1004,7 @@ def run(a) -> int:
             cmd = LP.wrap_gpu(cmd, gpu_dir)
     r = Run(res, ref, o, profiled=bool(kinds))
     t0 = time.time()
+    trace = CpuTrace(a.cpu_every).start() if a.cpu_every > 0 else None
     try:
         eng = Engine(cmd, env, cfg.get("cwd") or str(ROOT), log_path)
         eng.exe = res["exe"]   # (the engine's own binary, under a wrapper too)
@@ -704,6 +1017,9 @@ def run(a) -> int:
     finally:
         if eng is not None:
             eng.close()
+        if trace is not None:
+            trace.stop()
+            cpu_summary(res, trace)
         if prof is not None:
             res["profile_steps"] = prof.notes
             if "gpu" in kinds:
@@ -712,6 +1028,8 @@ def run(a) -> int:
         out_path.write_text(json.dumps(res) + "\n", encoding="utf-8")
     if a.quality and not res["error"]:
         import lab_quality as LQ  # noqa: E402  (numpy)
+        if a.lane_cal:   # (the quality's loads start from the frozen lane file too, not the run's verdict)
+            shutil.copyfile(a.lane_cal, runs / a.label / f"{stamp}-lane-times.txt")
         base_cmd = [res["exe"]] + engine_setup(a, json.loads(cfg_path.read_text(encoding="utf-8")))[0][2:]
         try:
             res["quality"] = LQ.run_quality(base_cmd, env, cfg.get("cwd") or str(ROOT), w.quality, out_path.with_suffix(""),
@@ -866,6 +1184,21 @@ def main() -> int:
                                                          "reference's (tools/lab_quality.py; two more engine loads)")
     r.add_argument("--no-mixed", action="store_true", help="leave out the mixed step (one conversation decoding while "
                                                           "another reads)")
+    r.add_argument("--mixed2", action="store_true", help="a second mixed step: two conversations answer while a third "
+                                                        "reads (--parallel 3)")
+    r.add_argument("--long-read", type=int, default=0, help="a fresh prompt of this many tokens, read after the mixed "
+                                                           "steps (read_long)")
+    r.add_argument("--long-answer", type=int, default=0, help="one answer of this many tokens, its end tokens banned, "
+                                                             "last: its speed slice by slice beside the CPU's clock, "
+                                                             "temperature and power (long_decode*)")
+    r.add_argument("--lane-cal", help="DeepSeek: a frozen copy of the PCIe lane's times file (the pack's "
+                                      "lane-times.txt) every compared run starts from (DS4_LANE_CAL: the engine keeps "
+                                      "its lane verdict there for the next start)")
+    r.add_argument("--cpu-every", type=float, default=1.0, help="seconds between the CPU trace's samples (0: none)")
+    r.add_argument("--pause-check", action="store_true", help="a prompt read beside an answer (DS4_LAYER_YIELD pauses it) "
+                                                             "against the same read alone, and the answer against "
+                                                             "itself alone, to the last digit - a gate; run it with "
+                                                             "--arg=--no-expert-cache (nothing moves between them)")
     s = sub.add_parser("show", help="labels' runs side by side, the first label the reference")
     s.add_argument("labels", nargs="+")
     s.add_argument("--runs", default=str(ROOT / "lab-runs"))

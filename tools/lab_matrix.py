@@ -30,7 +30,8 @@ import statistics as st
 from pathlib import Path
 
 KEY_METRICS = ("turn", "read_prefix", "read16", "read64", "read256", "read1024", "read4096", "decode",
-               "mixed_decode", "mixed_read", "mixed_gap")
+               "mixed_decode", "mixed_read", "mixed_gap", "mixed2_decode", "mixed2_read", "mixed2_gap", "read_long",
+               "long_decode", "long_decode_start", "long_decode_end")
 
 
 def configs(spec: dict) -> list[dict[str, int]]:
