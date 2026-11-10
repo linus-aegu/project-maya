@@ -279,6 +279,10 @@ public:
     /// Stop does, but keeps the chunks read - feed() / feed_mark() return true having taken fed() of their tokens (the
     /// rest a later feed's; feed_mark's checkpoint then not kept).  Not on a run that goes layer by layer.
     void set_yield(std::function<bool()> f);
+    /// DS4_LAYER_YIELD=N (one GPU, opt-in): while a run of chunks goes through the layers and `wants` is true, the
+    /// chunk waits after every N-th layer and `run` (the main thread: the other conversations' round of tokens) goes
+    /// between, then the chunk goes on.  `run` must leave the bound conversation as it found it.  nullptr: off.
+    void set_between(std::function<bool()> wants, std::function<void()> run);
     int fed() const;   // the tokens the last feed() / feed_mark() took (all of them unless a yield)
     /// A request starts (before its prompt): DISK_SKIP_AUTO may switch back on here, never mid-answer.
     void begin_request();

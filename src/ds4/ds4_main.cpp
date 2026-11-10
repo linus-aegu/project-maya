@@ -2135,13 +2135,25 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         };
         // the next `piece` tokens of its prompt into its conversation (a STOP ends it here, its DONE written); `yield`:
         // the piece ends early at a chunk the model reaches once a line is waiting
+        // (DS4_LAYER_YIELD: the running answers' round between a chunk's layers - round_turn, set below it; the model
+        //  calls it only with the setting on)
+        std::function<void()> between_round;
         const auto read_turn = [&](Act& a, size_t piece, bool yield) {
             bind(a.seq);
             const long long rid = a.r.rid;
             if (yield) m.set_yield([&] { return lines_posted.load(std::memory_order_acquire) != lines_taken; });
+            // (the round binds the answers' conversations: this one bound again before the chunk goes on)
+            m.set_between([&] { return std::any_of(acts.begin(), acts.end(), [](const std::unique_ptr<Act>& p) {
+                                  return !p->reading && !p->done;
+                              }); },
+                          [&, s = a.seq] {
+                              between_round();
+                              bind(s);
+                          });
             const bool read = prompt_piece(a.r, " " + std::to_string(rid), [&in, rid] { return in.stopped(rid); }, a.P,
                                            piece);
             m.set_yield(nullptr);
+            m.set_between(nullptr, nullptr);
             if (!read) {
                 a.ended = a.done = true;
                 return;
@@ -2264,7 +2276,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             const bool several = acts.size() > 1;
             for (auto& ap : acts) {
                 Act& a = *ap;
-                if (a.reading) continue;
+                if (a.reading || a.done) continue;   // (done: settle takes it - a round between a chunk's layers comes first)
                 for (;;) {
                     if (in.stopped(a.r.rid)) {
                         a.finish = "cancel";
@@ -2528,6 +2540,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 }
             }
         };
+        between_round = [&] { round_turn(); };
         // the next prompt in line reads a piece (its first token picked once it is all read), then goes to the back.
         // Alone - no other prompt read, no answer running - the rest of it in one run, the pipeline full throughout,
         // until a line comes (a request: the run ends at the next chunk all stages reach, and pieces again)
