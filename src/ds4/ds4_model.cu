@@ -1130,6 +1130,43 @@ struct Model::Impl {
     // at a chunk there, never mid-chunk (halt_now), unless a Stop follows
     std::function<bool()> yield_to;
     std::atomic<bool> yielding{false};
+    // DS4_LAYER_YIELD=N (Model::set_between): the chunk waits after every N-th layer while the main thread runs the
+    // other conversations' round - one GPU, the flow, the chunk's buffers its own (no borrow), no Engram prefetch
+    std::function<bool()> between_wants;
+    std::function<void()> between_run;
+    const int layer_yield = [] {
+        const char* v = ds4_env("DS4_LAYER_YIELD");
+        return v != nullptr ? std::max(0, std::atoi(v)) : 0;
+    }();
+    // (DS4_LAYER_YIELD_MS: the prompt reads at least this long between two rounds - without it each round asks for
+    //  the next pause at once and the read only gets the layers a round takes, whatever DS4_LAYER_YIELD says)
+    const double layer_yield_ms = [] {
+        const char* v = ds4_env("DS4_LAYER_YIELD_MS");
+        return v != nullptr ? std::max(0.0, std::atof(v)) : 0.0;
+    }();
+    double ly_last = 0;                  // when the last round ended (now_ms), or the run began
+    bool ly_run = false;                 // this run pauses between layers
+    std::atomic<bool> ly_req{false};     // the main thread asks for a pause
+    bool ly_parked = false;              // the device waits (under ly_mu)
+    std::mutex ly_mu;
+    std::condition_variable ly_cv;
+    bool ly_between = false;             // the main thread runs a round between layers (cache_tick waits)
+    bool ly_said = false;                // (the note that it is not used, once)
+    // (the run's Engram reader in flight, on the device's thread: a pause waits for it first - it reads the bound
+    //  conversation's tokens, which the round's bind() parks)
+    std::future<void>* ly_eg = nullptr;
+    bool layer_pause(cudaStream_t s, int il, std::string& err) {   // (the device's thread, after layer il of a chunk)
+        if (!ly_run || (il + 1) % layer_yield != 0 || !ly_req.load(std::memory_order_acquire)) return true;
+        CK(cudaStreamSynchronize(s));
+        if (ly_eg != nullptr && ly_eg->valid()) ly_eg->wait();
+        std::unique_lock<std::mutex> lk(ly_mu);
+        ly_parked = true;
+        ly_cv.notify_all();
+        ly_cv.wait(lk, [&] { return !ly_req.load(std::memory_order_acquire); });
+        ly_parked = false;
+        ly_cv.notify_all();   // (the main thread asks for the next pause only once this one is left)
+        return true;
+    }
     // a run a yield may end: no device starts chunk k before chunk k - (the stages + kYieldSlack) is through every
     // layer - the stages all still busy, and the chunks a yield waits for no more than that (a device's host otherwise
     // runs chunks ahead of its GPU, and its stage ahead of the next: a yield's cut came 5 chunks past the done ones)
@@ -12103,6 +12140,9 @@ struct Model::Impl {
         tick_jobs.clear();
     }
     void cache_tick(int T) {
+        // (DS4_LAYER_YIELD: a round between a chunk's layers moves nothing - the chunk's next layers were laid out for
+        //  the tables as they are; the swaps wait for the next tick after the run)
+        if (ly_between) return;
         tick_begin();
         rc_tick();
         hr_tick(T);   // (DS4_HELPER_RECENT: before the swaps, whose queue takes this window's CPU-lane hits)
@@ -18133,6 +18173,7 @@ struct Model::Impl {
             CK(cudaMemcpyAsync(c.pre, c.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
             prof_mark(d, 3);
             kick(s);
+            if (!layer_pause(s, L0.il, err)) return false;
             return true;
         }
         // the streamed experts as their batches arrive (each batch's slots freed for the copies at once), the VRAM ones
@@ -18720,6 +18761,11 @@ struct Model::Impl {
         };
         std::future<void> eg_next;
         if (!egs.empty() && eg_src == di) eg_next = std::async(std::launch::async, read_eg, 0);
+        struct LyEg {   // (DS4_LAYER_YIELD: a pause waits for this reader; every way out unsets it)
+            std::future<void>*& p;
+            ~LyEg() { p = nullptr; }
+        } ly_eg_end{ly_eg};
+        if (ly_run) ly_eg = &eg_next;
         for (int k = 0; k < nk; ++k) {
             if (run_yields) {
                 const int back = k - ((int) groups.size() + kYieldSlack);
@@ -20396,6 +20442,18 @@ struct Model::Impl {
         }
         bool halting = false, stopping = false;
         run_yields = yield_to != nullptr && !lm && !logits_all;
+        ly_run = false;
+        if (layer_yield > 0 && between_run && between_wants && !lm && !logits_all) {
+            const char* why = devs.size() != 1 ? "one GPU only" : !chunks[0]->flow ? "the flow only (DS4_FLOW_COPY_DMA)"
+                            : chunks[0]->borrow ? "a chunk on borrowed expert slots (the answers would read them)"
+                            : eg_pf != nullptr ? "with the Engram prefetch running" : nullptr;
+            if (why != nullptr && !ly_said) {
+                std::fprintf(stderr, "ds4: DS4_LAYER_YIELD=%d not used for this run: %s\n", layer_yield, why);
+                ly_said = true;
+            }
+            ly_run = why == nullptr;
+            ly_last = now_ms();
+        }
         eg_abort.store(false);
         if (prefetch) prefetch->start();
         // (DS4_FLOW_HELPER_CHECK: the load's first N runs)
@@ -20445,6 +20503,39 @@ struct Model::Impl {
                 if (halt_k == INT_MAX) halt_k = halt_seen + 1;
                 halt.store(true, std::memory_order_release);
                 if (eg_pf != nullptr) eg_pf->wake();
+            }
+            if (ly_run && !all && !halting && now_ms() - ly_last >= layer_yield_ms && between_wants()) {   // (DS4_LAYER_YIELD: the others' round between layers)
+                ly_req.store(true, std::memory_order_release);
+                bool parked = false;
+                {
+                    std::unique_lock<std::mutex> lk(ly_mu);
+                    while (!ly_parked) {
+                        ly_cv.wait_for(lk, std::chrono::milliseconds(2));
+                        if (ly_parked) break;
+                        bool idle = true;
+                        for (auto& w : workers) idle = idle && w->idle();
+                        if (idle) break;   // (the run ended before a layer it pauses after)
+                    }
+                    parked = ly_parked;
+                }
+                if (parked) {
+                    main_at.store("a run of chunks: paused between layers, the other answers' round",
+                                  std::memory_order_relaxed);
+                    const int nl = n_logits;   // (a round's windows set their own: the run's last chunk reads it)
+                    ly_between = true;
+                    between_run();
+                    ly_between = false;
+                    n_logits = nl;
+                    ly_last = now_ms();
+                    main_at.store("a run of chunks: waiting for the devices", std::memory_order_relaxed);
+                }
+                {   // (released, and waited for: asked again at once, a device still waking would not move on)
+                    std::unique_lock<std::mutex> lk(ly_mu);
+                    ly_req.store(false, std::memory_order_release);
+                    ly_cv.notify_all();
+                    ly_cv.wait(lk, [&] { return !ly_parked; });
+                }
+                if (parked) continue;
             }
             if (progress && lm) {   // (layer-major: the share of the layers every chunk went through)
                 const int nd = lm_layers.load(std::memory_order_acquire);
@@ -20939,6 +21030,11 @@ struct Model::Impl {
     bool forward_par(int64_t p0, int T, std::string& err) {
         wplan.win = ++win_seq;
         win_now.store(wplan.win, std::memory_order_release);
+        if (ly_between) {   // (DS4_LAYER_YIELD, one GPU: its thread waits between a chunk's layers - this thread runs it)
+            if (run_dev(0, p0, T, wplan, err)) return true;
+            if (err.empty()) err = "a device's thread failed";
+            return false;
+        }
         std::vector<std::string> errs(devs.size());
         for (size_t di = 0; di < devs.size(); ++di)
             workers[di]->submit([this, di, p0, T, &errs] {
@@ -22713,6 +22809,10 @@ int Model::pipeline_stages() const { return std::max(1, (int) p_->groups.size())
 void Model::set_progress(std::function<void(int64_t)> f) { p_->progress = std::move(f); }
 void Model::set_cancel(std::function<bool()> f) { p_->cancel = std::move(f); }
 void Model::set_yield(std::function<bool()> f) { p_->yield_to = std::move(f); }
+void Model::set_between(std::function<bool()> wants, std::function<void()> run) {
+    p_->between_wants = std::move(wants);
+    p_->between_run = std::move(run);
+}
 int Model::fed() const { return p_->fed_n; }
 bool Model::cancelled() const { return p_->halted; }
 bool Model::broken() { return p_->broken(); }
