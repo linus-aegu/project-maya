@@ -1693,7 +1693,7 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_kernel(const float* __re
     int n_win, n_sel, w0;
     if (ar.gen) {
         const long long ta = ar.t0 + t, pa = ar.p0 + ta;
-        const long long first = max((long long) ar.win - ar.p0, ta + 1);   // the window buffer row of max(0, pa - win + 1)
+        const long long first = max((long long) ar.win - ar.p0 + ar.lo, ta + 1);   // the window buffer row of max(lo, pa - win + 1)
         w0 = (int) first;
         n_win = (int) (ar.win + ta - first + 1);
         n_sel = ar.R > 0 ? (int) min((long long) ar.kcap, (pa + 1) / ar.R) : 0;
@@ -1901,7 +1901,7 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_packed_kernel(const floa
     int n_win, n_sel, w0;
     if (ar.gen) {
         const long long ta = ar.t0 + t, pa = ar.p0 + ta;
-        const long long first = max((long long) ar.win - ar.p0, ta + 1);
+        const long long first = max((long long) ar.win - ar.p0 + ar.lo, ta + 1);
         w0 = (int) first;
         n_win = (int) (ar.win + ta - first + 1);
         n_sel = ar.R > 0 ? (int) min((long long) ar.kcap, (pa + 1) / ar.R) : 0;
@@ -2095,7 +2095,7 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_wmma_kernel(const float*
     int n_win, n_sel, w0;
     if (ar.gen) {
         const long long ta = ar.t0 + t, pa = ar.p0 + ta;
-        const long long first = max((long long) ar.win - ar.p0, ta + 1);
+        const long long first = max((long long) ar.win - ar.p0 + ar.lo, ta + 1);
         w0 = (int) first;
         n_win = (int) (ar.win + ta - first + 1);
         n_sel = ar.R > 0 ? (int) min((long long) ar.kcap, (pa + 1) / ar.R) : 0;
@@ -2295,7 +2295,7 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_mma_kernel(const float* 
     int n_win, n_sel, w0;
     if (ar.gen) {
         const long long ta = ar.t0 + t, pa = ar.p0 + ta;
-        const long long first = max((long long) ar.win - ar.p0, ta + 1);
+        const long long first = max((long long) ar.win - ar.p0 + ar.lo, ta + 1);
         w0 = (int) first;
         n_win = (int) (ar.win + ta - first + 1);
         n_sel = ar.R > 0 ? (int) min((long long) ar.kcap, (pa + 1) / ar.R) : 0;
@@ -4280,7 +4280,7 @@ __global__ void __launch_bounds__(kV7Threads, 1) sparse_attn_v7_kernel(const flo
     int n_win, n_sel, w0;
     if (ar.gen) {
         const long long ta = ar.t0 + t, pa = ar.p0 + ta;
-        const long long first = max((long long) ar.win - ar.p0, ta + 1);
+        const long long first = max((long long) ar.win - ar.p0 + ar.lo, ta + 1);
         w0 = (int) first;
         n_win = (int) (ar.win + ta - first + 1);
         n_sel = ar.R > 0 ? (int) min((long long) ar.kcap, (pa + 1) / ar.R) : 0;
