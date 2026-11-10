@@ -1515,6 +1515,10 @@ struct Model::Impl {
     Exl3Lane lane_x;                            // (cpu_experts' view of them, ds4_cpu_exl3.hpp)
     // the state
     int64_t pos = 0;
+    // DS4_YOCO=2: the decoder layers' (ratio 1) replay start - their rings hold nothing of this conversation's
+    // before it, so their windows start there (paper 3.2.2: a query at i sees max(s, i - W + 1) .. i); 0: none
+    int64_t win_lo = 0;
+    int64_t lo_of(const Layer& l) const { return l.ratio == 1 ? win_lo : 0; }
     std::vector<int32_t> toks, ctoks;
     struct Check {                    // the state at a position: every window ring, the compressors' partial groups
         int64_t pos = -1;
@@ -1539,7 +1543,7 @@ struct Model::Impl {
     // host state here (a multi step reads every conversation's from here), seq_unpark() back.  Every conversation's
     // device pointers stay here, the bound one's too.
     struct SeqState {
-        int64_t pos = 0;
+        int64_t pos = 0, win_lo = 0;
         std::vector<int32_t> toks, ctoks;
         Check ck[3];
         std::vector<Check> mk;
@@ -9615,6 +9619,7 @@ struct Model::Impl {
     void seq_park() {
         SeqState& q = sqs[(size_t) sq_bound];
         q.pos = pos;
+        q.win_lo = win_lo;
         q.toks = std::move(toks);
         q.ctoks = std::move(ctoks);
         for (int i = 0; i < 3; ++i) q.ck[i] = std::move(ck[i]);
@@ -9627,6 +9632,7 @@ struct Model::Impl {
     void seq_unpark() {
         SeqState& q = sqs[(size_t) sq_bound];
         pos = q.pos;
+        win_lo = q.win_lo;
         toks = std::move(q.toks);
         ctoks = std::move(q.ctoks);
         for (int i = 0; i < 3; ++i) ck[i] = std::move(q.ck[i]);
@@ -9668,6 +9674,7 @@ struct Model::Impl {
 
     void reset() {
         pos = 0;
+        win_lo = 0;
         toks.clear();
         ctoks.clear();
         slot_held = false;
@@ -9816,6 +9823,7 @@ struct Model::Impl {
             cudaStreamSynchronize(d.st);
         }
         pos = c.pos;
+        win_lo = 0;   // (a checkpoint's rings: its own window's, whole)
         toks.resize((size_t) pos);
         ctoks.resize((size_t) pos);
         slot_held = false;
@@ -10200,6 +10208,7 @@ struct Model::Impl {
             return false;
         }
         pos = n_pos;
+        win_lo = 0;   // (a slot's rings: its own window's, whole)
         toks.swap(toks_in);
         ctoks.resize((size_t) pos);
         for (size_t i = 0; i < (size_t) pos; ++i)
@@ -17986,6 +17995,7 @@ struct Model::Impl {
             AttnRows ar;
             ar.gen = 1;
             ar.p0 = p0;
+            ar.lo = lo_of(l);
             ar.t0 = a0;
             ar.win = g.win;
             ar.R = l.ratio;
@@ -20185,6 +20195,24 @@ struct Model::Impl {
             run.cut_k = std::min(fp.cut_k, k1) - k0;
             run.cut_r = fp.cut_k < k1 ? fp.cut_r : 0;
         }
+        // DS4_YOCO=2: the decoder replays the rows from the cut (the prompt's last 128) and sees none before it -
+        // also a later feed's rows of the same prompt (a server's pieces): win_lo stays until the conversation's
+        // position goes back (reset, restore, a slot)  (#718)
+        if (fp.skip >= 0 && k0 <= fp.cut_k) {
+            if (yoco_mode() == 2) win_lo = pos - x0 + (fp.cut_k > 0 ? fp.ends[(size_t) fp.cut_k - 1] : 0) + fp.cut_r;
+            // (DS4_YOCO_POISON, tests: the decoder rings' rows before the cut filled with NaN bytes first - a window
+            //  that still reads one moves the logits)
+            static const bool poison = std::getenv("DS4_YOCO_POISON") != nullptr;
+            for (int il = fp.skip; poison && il < g.nl; ++il)
+                for (int m = 0; m < L[(size_t) il].nm; ++m) {
+                    Layer& l = member(L[(size_t) il], m);
+                    Dev& d = devs[(size_t) l.dev];
+                    cudaSetDevice(d.id);
+                    CK(cudaDeviceSynchronize());
+                    CK(cudaMemsetAsync(l.win, 0xff, (size_t) g.win * win_rb(), d.st));
+                    CK(cudaStreamSynchronize(d.st));
+                }
+        }
         logits_all = logits_rows > kWin;
         if (logits_all) chunk_logits.resize((size_t) n * g.vocab);
         for (int t = 0; t < n; ++t) {
@@ -21300,7 +21328,7 @@ struct Model::Impl {
                 ar.nsel[t] = T;
                 continue;
             }
-            const int first = (int) std::max<int64_t>(g.win - p0, t + 1);   // ext row of position max(0, p - win + 1)
+            const int first = (int) std::max<int64_t>(g.win - p0 + lo_of(l), t + 1);   // ext row of position max(lo, p - win + 1)
             ar.win0[t] = first;
             ar.nwin[t] = g.win + t - first + 1;
             ar.nsel[t] = 0;

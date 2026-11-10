@@ -245,7 +245,7 @@ struct AttnRows {
     int win0[kWin], nwin[kWin], nsel[kWin];
     // gen: query t is a chunk's row t0 + t at position p0 + t0 + t (the window buffer: the ring's win rows before p0,
     // then the chunk's), selecting min(kcap, (its position + 1) / R) compressed rows when R > 0; its window starts at
-    // position lo or later (0: the whole window - a truncated prompt's consumer layers see only its tail)
+    // position lo or later (0: the whole window; DS4_YOCO=2's decoder layers: the replay's start, Impl::win_lo)
     int gen = 0, t0 = 0, win = 0, R = 0, kcap = 0;
     long long p0 = 0, lo = 0;
 };
