@@ -1,0 +1,73 @@
+{
+ "exe": "/home/linus/maya-r5/build-hip/maya-ds4",
+ "args": [
+  "--pack",
+  "/home/linus/Maya-data/models/DeepSeek-V4.1-Flash-1017-GGUF/Maya-XS/maya-ds4",
+  "--max-context",
+  "131072",
+  "--tp",
+  "1",
+  "--threads",
+  "on",
+  "--reserve-mib",
+  "1024",
+  "--dspark",
+  "none",
+  "--ssd-cache",
+  "auto",
+  "--parallel",
+  "3",
+  "--ablate",
+  "/home/linus/Maya-data/models/refusal-directions/DeepSeek-V4.1-Flash-refusal-direction.gguf",
+  "--ablate-default",
+  "off"
+ ],
+ "cwd": "/home/linus/maya-r5",
+ "tokenizer": "/home/linus/Maya-data/models/DeepSeek-V4.1-Flash-1017-GGUF/Maya-XS/maya-ds4/tokenizer",
+ "backend": "hip",
+ "model_name": "deepseek-v4.1-flash",
+ "gpu": [
+  0
+ ],
+ "sampling": {
+  "temperature": 1.0,
+  "top_p": 1.0
+ },
+ "reasoning_effort": "high",
+ "lib_dirs": [
+  "/opt/rocm-7.1.0/lib"
+ ],
+ "port": 8080,
+ "host": "0.0.0.0",
+ "log": "/home/linus/maya-r5/maya-ds4-hip.log",
+ "installer": {
+  "family": "deepseek",
+  "models_dir": "/home/linus/Maya-data/models",
+  "quant": "DeepSeek-V4.1-Flash-1017",
+  "ds4_quant": "maya-xs",
+  "model_dir": "/home/linus/Maya-data/models/DeepSeek-V4.1-Flash-1017-GGUF/Maya-XS",
+  "written": "2026-11-11 22:36",
+  "speed_calibration": {
+   "date": "2026-11-11 22:36",
+   "failed": "the engine exited before it was ready (see /home/linus/maya-r5/maya-ds4-hip.log)"
+  }
+ },
+ "ablate": {
+  "file": "/home/linus/Maya-data/models/refusal-directions/DeepSeek-V4.1-Flash-refusal-direction.gguf",
+  "model": "DeepSeek-V4.1-Flash",
+  "fitted_on": "Maya-S"
+ },
+ "env": {
+  "DEBUG_HIP_MEM_POOL_VMHEAP": "0",
+  "MAYA_DS4_RAM_SKIP_W": "0.16",
+  "MAYA_DS4_SLOT_KEEP": "1",
+  "DS4_CHUNK_GFX11": "0",
+  "MAYA_DS4_PROMPT_SKIP": "2",
+  "DS4_FLOW_COPY_DMA": "1",
+  "DS4_IQ1S512": "1",
+  "DS4_BORROW": "0",
+  "DS4_LAYER_YIELD": "1",
+  "DS4_LAYER_YIELD_MS": "100"
+ },
+ "thinking_budget": 3000
+}
